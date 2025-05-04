@@ -548,20 +548,111 @@ process_dash_protection_data (GstOpenCDMDecryptor * self,
     const gchar * system_id, GstBuffer * data, const gchar * origin)
 {
   GstBuffer *init_data = NULL;
-  gchar *scheme_uuid = NULL;
-  gboolean success = gst_eme_parse_dash_content_protection_block (data,
-      &scheme_uuid, NULL, NULL, &init_data);
-  if (!success) {
-    GST_ERROR_OBJECT (self,
-        "failed to parse DASH XML content protection block");
+  GstMapInfo info;
+  guint8 *pssh_data = NULL;
+  gsize pssh_size = 0;
+  gboolean success = FALSE;
+  
+  GST_DEBUG_OBJECT (self, "Processing DASH protection data with system_id: %s, origin: %s",
+                    system_id ? system_id : "(null)", origin ? origin : "(null)");
+
+  /* Map the buffer to access its data */
+  if (!gst_buffer_map (data, &info, GST_MAP_READ)) {
+    GST_ERROR_OBJECT (self, "Failed to map protection data buffer");
     return FALSE;
   }
-  if (init_data == NULL) {
-    GST_DEBUG ("skipping content protection block due to no init data");
-    return TRUE;
+
+  /* Log the size of the protection data */
+  GST_DEBUG_OBJECT (self, "Protection data size: %" G_GSIZE_FORMAT " bytes", info.size);
+  
+  /* Simple approach: Search for PSSH data directly */
+  /* PSSH identifier in Base64 is "cHNzaA==" */
+  const gchar *pssh_marker = "pssh>";
+  const gchar *base64_start = NULL;
+  gchar *content = g_strndup ((const gchar *)info.data, info.size);
+  
+  /* Debug output - log the first 200 chars of content */
+  GST_DEBUG_OBJECT (self, "Protection data (first 200 chars): %.200s%s", 
+                   (gchar *)info.data, info.size > 200 ? "..." : "");
+  
+  GST_DEBUG_OBJECT (self, "Searching for PSSH marker: %s", pssh_marker);
+  base64_start = g_strstr_len (content, info.size, pssh_marker);
+  if (base64_start) {
+    base64_start += 5; /* Skip "pssh>" */
+    GST_DEBUG_OBJECT (self, "Found PSSH tag, content starts at offset: %ld", 
+                      (long)(base64_start - content));
+    
+    /* Find the end of the Base64 data (before </pssh) */
+    const gchar *base64_end = g_strstr_len (base64_start, 
+                                          info.size - (base64_start - content), 
+                                          "</pssh");
+    
+    if (base64_end) {
+      /* Extract the Base64-encoded PSSH data */
+      gsize base64_len = base64_end - base64_start;
+      gchar *base64_data = g_strndup (base64_start, base64_len);
+      
+      GST_DEBUG_OBJECT (self, "Found Base64 PSSH data (length: %zu): %.50s%s", 
+                        base64_len, base64_data, base64_len > 50 ? "..." : "");
+      
+      /* Decode the Base64 data */
+      pssh_data = g_base64_decode (base64_data, &pssh_size);
+      if (pssh_data && pssh_size > 0) {
+        GST_INFO_OBJECT (self, "Successfully decoded PSSH data: %zu bytes", pssh_size);
+        GST_MEMDUMP_OBJECT (self, "PSSH data", pssh_data, MIN(pssh_size, 32));
+        
+        init_data = gst_buffer_new_wrapped (pssh_data, pssh_size);
+        success = TRUE;
+      } else {
+        GST_ERROR_OBJECT (self, "Failed to decode Base64 PSSH data");
+        g_free (pssh_data);
+      }
+      
+      g_free (base64_data);
+    } else {
+      GST_ERROR_OBJECT (self, "Could not find end of PSSH data (</pssh>)");
+      
+      /* Log the content after pssh> tag to help debug */
+      gsize remaining = info.size - (base64_start - content);
+      GST_DEBUG_OBJECT (self, "Content after 'pssh>' (up to 100 chars): %.100s%s",
+                        base64_start, remaining > 100 ? "..." : "");
+    }
+  } else {
+    GST_ERROR_OBJECT (self, "Could not find PSSH data in protection block");
+    
+    /* Try alternative pssh tag formats */
+    const gchar *alt_markers[] = {"cenc:pssh>", "<pssh", "PSSH>", NULL};
+    for (int i = 0; alt_markers[i] != NULL; i++) {
+      GST_DEBUG_OBJECT (self, "Trying alternative marker: %s", alt_markers[i]);
+      if (g_strstr_len (content, info.size, alt_markers[i])) {
+        GST_INFO_OBJECT (self, "Found alternative marker %s but couldn't parse it correctly", 
+                        alt_markers[i]);
+      }
+    }
   }
-  return post_eme_encrypted_message (self, system_id, "cenc", init_data, origin,
-      data);
+  
+  g_free (content);
+  gst_buffer_unmap (data, &info);
+  
+  if (!success) {
+    GST_ERROR_OBJECT (self, "Failed to extract initialization data");
+    return FALSE;
+  }
+  
+  /* Post the EME encrypted message */
+  GST_INFO_OBJECT (self, "Posting EME encrypted message with init_data size: %" G_GSIZE_FORMAT, 
+                  gst_buffer_get_size(init_data));
+  gboolean result = post_eme_encrypted_message (self, system_id, "cenc", 
+                                                init_data, origin, data);
+  
+  if (result) {
+    GST_INFO_OBJECT (self, "Successfully posted EME encrypted message");
+  } else {
+    GST_ERROR_OBJECT (self, "Failed to post EME encrypted message");
+  }
+  
+  gst_buffer_unref (init_data);
+  return result;
 }
 
 static gboolean
