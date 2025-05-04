@@ -565,70 +565,71 @@ process_dash_protection_data (GstOpenCDMDecryptor * self,
   /* Log the size of the protection data */
   GST_DEBUG_OBJECT (self, "Protection data size: %" G_GSIZE_FORMAT " bytes", info.size);
   
-  /* Simple approach: Search for PSSH data directly */
-  /* PSSH identifier in Base64 is "cHNzaA==" */
-  const gchar *pssh_marker = "pssh>";
-  const gchar *base64_start = NULL;
+  /* Make a copy for string operations */
   gchar *content = g_strndup ((const gchar *)info.data, info.size);
   
   /* Debug output - log the first 200 chars of content */
   GST_DEBUG_OBJECT (self, "Protection data (first 200 chars): %.200s%s", 
-                   (gchar *)info.data, info.size > 200 ? "..." : "");
+                   content, info.size > 200 ? "..." : "");
   
-  GST_DEBUG_OBJECT (self, "Searching for PSSH marker: %s", pssh_marker);
-  base64_start = g_strstr_len (content, info.size, pssh_marker);
+  /* Try different possible PSSH markers */
+  const gchar *markers[] = {"<cenc:pssh>", "<pssh>", "pssh>", "PSSH>", NULL};
+  const gchar *base64_start = NULL;
+  
+  for (int i = 0; markers[i] != NULL && !base64_start; i++) {
+    GST_DEBUG_OBJECT (self, "Trying PSSH marker: %s", markers[i]);
+    base64_start = g_strstr_len (content, info.size, markers[i]);
+    if (base64_start) {
+      base64_start += strlen(markers[i]);  /* Skip the marker */
+      GST_DEBUG_OBJECT (self, "Found PSSH tag '%s', content starts at offset: %ld", 
+                       markers[i], (long)(base64_start - content));
+      break;
+    }
+  }
+  
   if (base64_start) {
-    base64_start += 5; /* Skip "pssh>" */
-    GST_DEBUG_OBJECT (self, "Found PSSH tag, content starts at offset: %ld", 
-                      (long)(base64_start - content));
+    /* Try different possible end markers */
+    const gchar *end_markers[] = {"</cenc:pssh>", "</pssh>", NULL};
+    const gchar *base64_end = NULL;
     
-    /* Find the end of the Base64 data (before </pssh) */
-    const gchar *base64_end = g_strstr_len (base64_start, 
-                                          info.size - (base64_start - content), 
-                                          "</pssh");
-    
-    if (base64_end) {
-      /* Extract the Base64-encoded PSSH data */
-      gsize base64_len = base64_end - base64_start;
-      gchar *base64_data = g_strndup (base64_start, base64_len);
-      
-      GST_DEBUG_OBJECT (self, "Found Base64 PSSH data (length: %zu): %.50s%s", 
-                        base64_len, base64_data, base64_len > 50 ? "..." : "");
-      
-      /* Decode the Base64 data */
-      pssh_data = g_base64_decode (base64_data, &pssh_size);
-      if (pssh_data && pssh_size > 0) {
-        GST_INFO_OBJECT (self, "Successfully decoded PSSH data: %zu bytes", pssh_size);
-        GST_MEMDUMP_OBJECT (self, "PSSH data", pssh_data, MIN(pssh_size, 32));
+    for (int i = 0; end_markers[i] != NULL && !base64_end; i++) {
+      GST_DEBUG_OBJECT (self, "Trying end marker: %s", end_markers[i]);
+      base64_end = g_strstr_len (base64_start, 
+                              info.size - (base64_start - content), 
+                              end_markers[i]);
+      if (base64_end) {
+        /* Extract the Base64-encoded PSSH data */
+        gsize base64_len = base64_end - base64_start;
+        gchar *base64_data = g_strndup (base64_start, base64_len);
         
-        init_data = gst_buffer_new_wrapped (pssh_data, pssh_size);
-        success = TRUE;
-      } else {
-        GST_ERROR_OBJECT (self, "Failed to decode Base64 PSSH data");
-        g_free (pssh_data);
+        GST_INFO_OBJECT (self, "Found Base64 PSSH data with end marker '%s' (length: %zu): %.50s%s", 
+                        end_markers[i], base64_len, base64_data, base64_len > 50 ? "..." : "");
+        
+        /* Decode the Base64 data */
+        pssh_data = g_base64_decode (base64_data, &pssh_size);
+        if (pssh_data && pssh_size > 0) {
+          GST_INFO_OBJECT (self, "Successfully decoded PSSH data: %zu bytes", pssh_size);
+          GST_MEMDUMP_OBJECT (self, "PSSH data", pssh_data, MIN(pssh_size, 32));
+          
+          init_data = gst_buffer_new_wrapped (pssh_data, pssh_size);
+          success = TRUE;
+        } else {
+          GST_ERROR_OBJECT (self, "Failed to decode Base64 PSSH data");
+          g_free (pssh_data);
+        }
+        
+        g_free (base64_data);
+        break;
       }
-      
-      g_free (base64_data);
-    } else {
-      GST_ERROR_OBJECT (self, "Could not find end of PSSH data (</pssh>)");
-      
-      /* Log the content after pssh> tag to help debug */
-      gsize remaining = info.size - (base64_start - content);
-      GST_DEBUG_OBJECT (self, "Content after 'pssh>' (up to 100 chars): %.100s%s",
-                        base64_start, remaining > 100 ? "..." : "");
+    }
+    
+    if (!base64_end) {
+      GST_ERROR_OBJECT (self, "Could not find end of PSSH data");
+      GST_DEBUG_OBJECT (self, "Content after PSSH tag (up to 100 chars): %.100s%s",
+                      base64_start, strlen(base64_start) > 100 ? "..." : "");
     }
   } else {
     GST_ERROR_OBJECT (self, "Could not find PSSH data in protection block");
-    
-    /* Try alternative pssh tag formats */
-    const gchar *alt_markers[] = {"cenc:pssh>", "<pssh", "PSSH>", NULL};
-    for (int i = 0; alt_markers[i] != NULL; i++) {
-      GST_DEBUG_OBJECT (self, "Trying alternative marker: %s", alt_markers[i]);
-      if (g_strstr_len (content, info.size, alt_markers[i])) {
-        GST_INFO_OBJECT (self, "Found alternative marker %s but couldn't parse it correctly", 
-                        alt_markers[i]);
-      }
-    }
   }
   
   g_free (content);
