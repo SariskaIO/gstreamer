@@ -1,4 +1,4 @@
 [wrap-git]
-url = https://gitlab.freedesktop.org/jyelloz/sparkle-cdm-widevine.git
+url = https://github.com/SariskaIO/sparkle-cdm-widevine.git
 revision = main
 depth = 1
